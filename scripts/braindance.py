@@ -367,6 +367,25 @@ if __name__ == "__main__":
 
     step = 0
     step_PHASE = 0
+
+    cameras = []
+    local_pos_offset = 0
+    local_yaw_offset = 0
+    local_pitch_offset = 0
+
+    def build_nerf_transforms_header(K, W, H):
+        return {
+            "fl_x": K[0, 0].cpu().numpy().item(),
+            "fl_y": K[1, 1].cpu().numpy().item(),
+            "cx": K[0, 2].cpu().numpy().item(),
+            "cy": K[1, 2].cpu().numpy().item(),
+            "w": W,
+            "h": H,
+            "aabb_scale": 4,
+            "frames": []
+        }
+    nerf_transforms = build_nerf_transforms_header(K, w, h)
+
     while True:
         ######## Boring stuff
         clock.tick(40)
@@ -379,6 +398,18 @@ if __name__ == "__main__":
         if keys[pygame.K_q]:
             if opt.video is not None:
                 writer.close()
+
+            if len(cameras) > 0:
+                import json
+                pose_dict = {i: p.cpu().numpy().tolist() for i, p in enumerate(cameras)}
+                with open("poses.json", "w") as f:
+                    json.dump(pose_dict, f, indent=4)
+                intr = torch.save(K, "intr.pt")
+
+                nerf_transforms_file = 'transforms.json'
+                with open(nerf_transforms_file, "w") as f:
+                    json.dump(nerf_transforms, f, indent=4)
+
             pygame.quit()
             quit()
 
@@ -440,15 +471,33 @@ if __name__ == "__main__":
                                                              camera_up))
         camera_dir = rotation@camera_dir
 
-        show_R, show_t = look_to(camera_pos, camera_dir, camera_up) # look from pos in direction dir
+        global_R, global_t = look_to(camera_pos, camera_dir, camera_up) # look from pos in direction dir
+        global_R = torch.as_tensor(global_R, dtype=torch.float32)
+        global_t = torch.as_tensor(global_t, dtype=torch.float32)
+
+
+        # local cam
+        rotation = np.array([[cosd(-camera_yaw-local_yaw_offset), 0.0, sind(-camera_yaw-local_yaw_offset)],
+                             [0.0, 1.0, 0.0],
+                             [-sind(-camera_yaw-local_yaw_offset), 0.0, cosd(-camera_yaw-local_yaw_offset)]])
+        camera_dir = rotation @ camera_dir
+
+        rotation = rotate_around_axis(camera_pitch-local_pitch_offset, np.cross(camera_dir,
+                                                             camera_up))
+        camera_dir = rotation @ camera_dir
+
+        show_R, show_t = look_to(camera_pos-local_pos_offset, camera_dir, camera_up)  # look from pos in direction dir
         show_R = torch.as_tensor(show_R, dtype=torch.float32)
         show_t = torch.as_tensor(show_t, dtype=torch.float32)
+
+
 
         ############# /Camera
         ###### control rendering
         if keys[pygame.K_SPACE]:
             RENDERING = True
             renderer.init(wrp_im, example, show_R, show_t)
+
 
         PRESSED = False
         if any(keys[k] for k in [pygame.K_a, pygame.K_d, pygame.K_w,
@@ -467,7 +516,59 @@ if __name__ == "__main__":
                 wrp_im = renderer()
 
         text = "Sampling" if renderer._active else None
+
         image, frame = to_surface(wrp_im, text)
+
+        if RENDERING and not renderer._active:
+
+            # save current image
+            import os
+            os.makedirs("output", exist_ok=True)
+            file_path = f"output/frame_{step}.png"
+            Image.fromarray(frame).save(file_path)
+
+            # save camera
+            cam = torch.cat((global_R, global_t[..., None]), dim=1)
+
+            # add back last column
+            hom = torch.zeros_like(cam[0:1, :])
+            hom[..., -1] = 1
+            cam = torch.cat([cam, hom], dim=0)
+
+            cameras.append(cam)
+
+            nerf_transforms["frames"].append({
+                "transform_matrix": cam.cpu().numpy().tolist(),
+                "file_path": file_path
+            })
+
+            '''
+            # update source image
+            im = frame / 127.5 - 1.0
+            im = im.astype(np.float32)
+            ims[0] = im
+
+            # compute depth for preview
+            dms = [None]
+            for i in range(ims.shape[0]):
+                midas_in = torch.tensor(ims[i])[None, ...].permute(0, 3, 1, 2).to(device)
+                scaled_idepth = midas.fixed_scale_depth(midas_in,
+                                                        return_inverse_depth=True,
+                                                        scale=renderer.scale)
+                dms[i] = 1.0 / scaled_idepth[0].cpu().numpy()
+
+            # update image
+            src_ims = torch.tensor(ims, dtype=torch.float32).to(src_ims)
+            src_dms = torch.tensor(dms, dtype=torch.float32).to(src_dms)
+
+            # update offset
+            local_pos_offset = camera_pos
+            local_pitch_offset = camera_pitch
+            local_yaw_offset = camera_yaw
+            '''
+
+            RENDERING = False
+
         surface.blit(image, (0,0))
         pygame.display.flip()
         if opt.video is not None:
